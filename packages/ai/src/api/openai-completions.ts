@@ -396,6 +396,22 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 
 					if (choice?.delta?.tool_calls) {
 						for (const toolCall of choice.delta.tool_calls) {
+							// Some gateways (e.g. AssemblyAI's Anthropic adapter) nest the
+							// tool-call id under `function.id` instead of the standard top-level
+							// `tool_calls[].id`. Lift it up so the id is captured; an empty id
+							// later 500s the follow-up request because the tool_use/tool_result
+							// ids can't be matched.
+							if (!toolCall.id) {
+								const nestedId = (toolCall.function as { id?: string } | undefined)?.id;
+								if (nestedId) toolCall.id = nestedId;
+							}
+							// The same adapter emits an empty tool_calls skeleton frame (no id,
+							// name, or arguments) before a plain text answer. Materializing it
+							// produces a phantom empty-named tool call that later 400/500s the
+							// follow-up request.
+							if (!toolCall.id && !toolCall.function?.name && !toolCall.function?.arguments) {
+								continue;
+							}
 							const block = ensureToolCallBlock(toolCall);
 							if (!block.id && toolCall.id) {
 								block.id = toolCall.id;
@@ -901,6 +917,20 @@ export function convertMessages(
 					content: sanitizeSurrogates(msg.content),
 				});
 			} else {
+				// Collapse single-text-only content to a plain string.
+				// Some gateways (e.g. AssemblyAI's LLM Gateway) reject array-form
+				// content for user messages even though the OpenAI chat-completions
+				// spec accepts both. Anthropic cache_control still works because
+				// addCacheControlToTextContent re-expands strings as needed.
+				if (msg.content.every((item) => item.type === "text")) {
+					const joined = msg.content.map((item) => sanitizeSurrogates(item.text)).join("");
+					if (joined.trim().length === 0) continue;
+					params.push({
+						role: "user",
+						content: joined,
+					});
+					continue;
+				}
 				const content: ChatCompletionContentPart[] = msg.content.map((item): ChatCompletionContentPart => {
 					if (item.type === "text") {
 						return {
