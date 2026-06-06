@@ -589,11 +589,17 @@ function buildParams(
 		params.store = false;
 	}
 
-	if (options?.maxTokens) {
+	// Fall back to the model's configured max when the caller omits maxTokens.
+	// The agent loop doesn't pass one, and some gateways (e.g. AssemblyAI's LLM
+	// Gateway) apply a stingy per-model default cap (Claude 1000, Kimi 2048, ...)
+	// when max_tokens is absent, silently truncating long responses and tool-call
+	// arguments. Mirrors the anthropic-messages provider, which already does this.
+	const effectiveMaxTokens = options?.maxTokens ?? (model.maxTokens > 0 ? model.maxTokens : undefined);
+	if (effectiveMaxTokens) {
 		if (compat.maxTokensField === "max_tokens") {
-			(params as any).max_tokens = options.maxTokens;
+			(params as any).max_tokens = effectiveMaxTokens;
 		} else {
-			params.max_completion_tokens = options.maxTokens;
+			params.max_completion_tokens = effectiveMaxTokens;
 		}
 	}
 
