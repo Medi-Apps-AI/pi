@@ -169,6 +169,10 @@ type ChatCompletionToolWithCacheControl = OpenAI.Chat.Completions.ChatCompletion
 	cache_control?: OpenAICompatCacheControl;
 };
 
+type ChatCompletionMessageWithCacheControl = ChatCompletionMessageParam & {
+	cache_control?: OpenAICompatCacheControl;
+};
+
 function resolveCacheRetention(cacheRetention?: CacheRetention, env?: ProviderEnv): CacheRetention {
 	if (cacheRetention) {
 		return cacheRetention;
@@ -651,7 +655,11 @@ function buildParams(
 	}
 
 	if (cacheControl) {
-		applyAnthropicCacheControl(messages, params.tools, cacheControl);
+		if (compat.cacheControlFormat === "anthropic-message") {
+			applyAnthropicMessageCacheControl(messages, cacheControl);
+		} else {
+			applyAnthropicCacheControl(messages, params.tools, cacheControl);
+		}
 	}
 
 	if (options?.toolChoice) {
@@ -795,7 +803,7 @@ function getCompatCacheControl(
 	compat: ResolvedOpenAICompletionsCompat,
 	cacheRetention: CacheRetention,
 ): OpenAICompatCacheControl | undefined {
-	if (compat.cacheControlFormat !== "anthropic" || cacheRetention === "none") {
+	if (!compat.cacheControlFormat || cacheRetention === "none") {
 		return undefined;
 	}
 
@@ -811,6 +819,39 @@ function applyAnthropicCacheControl(
 	addCacheControlToSystemPrompt(messages, cacheControl);
 	addCacheControlToLastTool(tools, cacheControl);
 	addCacheControlToLastConversationMessage(messages, cacheControl);
+}
+
+// Message-level placement for gateways that ignore cache_control inside
+// content parts and only honor it on the message object (e.g. AssemblyAI's
+// LLM Gateway). Content is left untouched, so user messages stay plain
+// strings, which such gateways also tend to require. Tools get no marker;
+// in Anthropic's prompt ordering (tools, then system, then messages) the
+// system breakpoint already covers the tool definitions.
+function applyAnthropicMessageCacheControl(
+	messages: ChatCompletionMessageParam[],
+	cacheControl: OpenAICompatCacheControl,
+): void {
+	for (const message of messages) {
+		if (message.role === "system" || message.role === "developer") {
+			(message as ChatCompletionMessageWithCacheControl).cache_control = cacheControl;
+			break;
+		}
+	}
+
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (message.role !== "user" && message.role !== "assistant" && message.role !== "tool") {
+			continue;
+		}
+		const content = message.content;
+		const hasContent =
+			typeof content === "string" ? content.length > 0 : Array.isArray(content) && content.length > 0;
+		if (!hasContent) {
+			continue;
+		}
+		(message as ChatCompletionMessageWithCacheControl).cache_control = cacheControl;
+		return;
+	}
 }
 
 function addCacheControlToSystemPrompt(
@@ -1300,6 +1341,7 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAIComplet
 	const isCloudflareAiGateway = provider === "cloudflare-ai-gateway" || baseUrl.includes("gateway.ai.cloudflare.com");
 	const isNvidia = provider === "nvidia" || baseUrl.includes("integrate.api.nvidia.com");
 	const isAntLing = provider === "ant-ling" || baseUrl.includes("api.ant-ling.com");
+	const isAssemblyAI = provider === "assemblyai" || baseUrl.includes("llm-gateway.assemblyai.com");
 
 	const isNonStandard =
 		isNvidia ||
@@ -1316,16 +1358,31 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAIComplet
 		baseUrl.includes("opencode.ai") ||
 		isCloudflareWorkersAI ||
 		isCloudflareAiGateway ||
-		isAntLing;
+		isAntLing ||
+		isAssemblyAI;
 
 	const useMaxTokens =
-		baseUrl.includes("chutes.ai") || isMoonshot || isCloudflareAiGateway || isTogether || isNvidia || isAntLing;
+		baseUrl.includes("chutes.ai") ||
+		isMoonshot ||
+		isCloudflareAiGateway ||
+		isTogether ||
+		isNvidia ||
+		isAntLing ||
+		isAssemblyAI;
 
 	const isGrok = provider === "xai" || baseUrl.includes("api.x.ai");
 	const isDeepSeek = provider === "deepseek" || baseUrl.includes("deepseek.com");
 	const isOpenRouterDeveloperRoleModel =
 		isOpenRouter && (model.id.startsWith("anthropic/") || model.id.startsWith("openai/"));
-	const cacheControlFormat = provider === "openrouter" && model.id.startsWith("anthropic/") ? "anthropic" : undefined;
+	// AssemblyAI's LLM Gateway only honors Anthropic prompt caching via
+	// cache_control placed on the message object itself; block-level markers
+	// are silently ignored. Caching is explicit only for Claude models there.
+	const cacheControlFormat =
+		provider === "openrouter" && model.id.startsWith("anthropic/")
+			? "anthropic"
+			: isAssemblyAI && model.id.startsWith("claude-")
+				? "anthropic-message"
+				: undefined;
 
 	return {
 		supportsStore: !isNonStandard,
@@ -1353,7 +1410,7 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAIComplet
 		vercelGatewayRouting: {},
 		chatTemplateKwargs: {},
 		zaiToolStream: false,
-		supportsStrictMode: !isMoonshot && !isTogether && !isCloudflareAiGateway && !isNvidia,
+		supportsStrictMode: !isMoonshot && !isTogether && !isCloudflareAiGateway && !isNvidia && !isAssemblyAI,
 		cacheControlFormat,
 		sendSessionAffinityHeaders: false,
 		deferredToolsMode: undefined,
