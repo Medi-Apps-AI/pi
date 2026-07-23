@@ -11,14 +11,15 @@ no refactors, only the changes listed below.
 All changes are confined to `packages/ai` and
 `packages/coding-agent/src/core/model-config.ts`, plus CI:
 
-- `ci: add fork binary release workflow` (57db4278):
-  `.github/workflows/release-binary.yml` and a hook in
-  `build-binaries.yml`. Fork-only release plumbing.
-- `fix(ai): support AssemblyAI LLM gateway in openai-completions`
-  (260633b2): request shaping the gateway requires.
-- `fix(ai): send model maxTokens fallback in openai-completions`
-  (cd2e78e9): gateway rejects requests without a max tokens value.
-- Prompt caching (this change):
+- `ci: add fork binary release workflow`:
+  `.github/workflows/release-binary.yml` and a fork guard in
+  `build-binaries.yml`. Fork-only release plumbing; see
+  "Making a release" below.
+- `fix(ai): support AssemblyAI LLM gateway in openai-completions`:
+  request shaping the gateway requires.
+- `fix(ai): send model maxTokens fallback in openai-completions`:
+  gateway rejects requests without a max tokens value.
+- `fix(ai): auto-detect AssemblyAI gateway prompt caching compat`:
   - New `compat.cacheControlFormat` value `"anthropic-message"`. The
     gateway only honors Anthropic `cache_control` placed on the message
     object itself and silently ignores Anthropic's native content-block
@@ -52,3 +53,32 @@ All changes are confined to `packages/ai` and
   upstream touches often.
 - Run `packages/ai` tests, then verify caching end to end: a repeat
   request through the gateway must bill only a few input tokens.
+
+## Making a release
+
+Releases are GitHub Releases on this fork carrying self-contained pi
+binaries, published by `.github/workflows/release-binary.yml`.
+Upstream's `build-binaries.yml` pipeline (npm publish, draft staging)
+is guarded to `earendil-works/pi` and skips entirely here.
+
+1. Update main first: on main, `git pull` (local main tracks
+   `upstream/main`, i.e. `earendil-works/pi`; `origin` is the fork).
+   Rebase this branch on top and verify (tests green, caching
+   verified per the checklist above).
+2. Tag the branch tip. Convention: `v<version>-medi`, where
+   `<version>` is the current `version` field in
+   `packages/coding-agent/package.json` (upstream bumps it; we never
+   do). No numeric suffix after `-medi`; one fork release per
+   upstream version. Lightweight tag is fine:
+   `git tag v0.81.1-medi`
+3. Push the tag: `git push origin v0.81.1-medi`. The tag push
+   triggers the workflow, which builds `pi-linux-x64` and
+   `pi-darwin-arm64` via `scripts/build-binaries.sh` and publishes
+   the release with auto-generated notes.
+
+Consumer contract: downstream CI pins a tag and runs
+`gh release download <tag> -p 'pi-linux-x64'`. The asset names
+`pi-linux-x64` and `pi-darwin-arm64` are the API; renaming them
+breaks consumers. A bare downloaded binary prints `0.0.0` for
+`--version` (the real version needs the sidecar `package.json`
+layout); this is expected, not a broken build.
