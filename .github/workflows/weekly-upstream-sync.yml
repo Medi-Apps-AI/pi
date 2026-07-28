@@ -1,0 +1,204 @@
+name: Weekly Upstream Sync
+
+# Fork-specific: mirrors main from upstream (earendil-works/pi), finds the
+# latest published upstream release tag, rebases the fork branch onto that
+# tag, verifies, then tags v<version>-medi. Any failure pushes nothing; a
+# rebase conflict or test failure needs a manual session per FORK.md.
+#
+# The rebase target is the upstream release tag, never upstream/main: main
+# accumulates unreleased commits at the same version number between
+# releases, and a -medi release must carry exactly upstream's release plus
+# the fork delta.
+#
+# Pushes authenticate via a short-lived installation token minted from the
+# medi-pi-sync GitHub App (secrets SYNC_APP_ID / SYNC_APP_PRIVATE_KEY; the
+# app has Contents + Workflows write on this repo only). The built-in
+# GITHUB_TOKEN cannot be used: it can never push workflow-file changes,
+# which upstream syncs routinely carry, and its tag pushes would not
+# trigger release-binary.yml. Custom-app pushes do both.
+#
+# NOTE: scheduled workflows only run from the repo's default branch, so the
+# fork's default branch must be the fork branch carrying this file (it cannot
+# be main, which must stay a fast-forwardable mirror of upstream).
+
+on:
+  schedule:
+    - cron: '15 20 * * 0' # Monday 06:15 AEST
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Exercise every step but push nothing and skip the release dispatch'
+        required: false
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: weekly-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      UPSTREAM_REPO: earendil-works/pi
+      FORK_BRANCH: feat/assembly-gateway
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
+    steps:
+      - name: Mint app token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.SYNC_APP_ID }}
+          private-key: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
+
+      - name: Checkout fork branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: feat/assembly-gateway
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Add upstream remote
+        run: git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+
+      # Independent of the release: main is a convenience mirror so local
+      # checkouts can `git pull` upstream from origin. Plain (non-force)
+      # push: fails if main has diverged from upstream, which means someone
+      # committed to main directly; fix that manually.
+      - name: Mirror main from upstream
+        if: env.DRY_RUN != 'true'
+        run: |
+          set -euo pipefail
+
+          git fetch upstream main
+          git push origin upstream/main:refs/heads/main
+
+      - name: Find latest upstream release
+        id: upstream
+        run: |
+          set -euo pipefail
+
+          tag="$(gh release list --repo "${UPSTREAM_REPO}" --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName')"
+          if [[ -z "${tag}" || "${tag}" == "null" ]]; then
+            echo "::error::Could not determine the latest upstream release tag."
+            exit 1
+          fi
+
+          git fetch upstream "refs/tags/${tag}:refs/tags/${tag}"
+
+          version="$(git show "${tag}:packages/coding-agent/package.json" | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).version')"
+          if [[ "v${version}" != "${tag}" ]]; then
+            echo "::error::package.json version ${version} at ${tag} does not match the tag name."
+            exit 1
+          fi
+
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream release: \`${tag}\`." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Version gate
+        id: gate
+        env:
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          tag="${UPSTREAM_TAG}-medi"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+          if [[ -n "$(git ls-remote --tags origin "refs/tags/${tag}")" ]]; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "Tag \`${tag}\` already exists; nothing to release." >> "$GITHUB_STEP_SUMMARY"
+            if [[ "${DRY_RUN}" == "true" ]]; then
+              echo "proceed=true" >> "$GITHUB_OUTPUT"
+              echo "Dry run: continuing through rebase and verify anyway." >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "proceed=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            echo "New upstream release detected; target tag \`${tag}\`." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Plain rebase is correct here: the gate guarantees a release newer than
+      # the one the branch currently sits on, so the branch base is always an
+      # ancestor of the target tag and only the fork commits get replayed.
+      - name: Rebase fork branch onto upstream release tag
+        if: steps.gate.outputs.proceed == 'true'
+        env:
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if ! git rebase "${UPSTREAM_TAG}"; then
+            git rebase --abort || true
+            echo "::error::Rebase of ${FORK_BRANCH} onto ${UPSTREAM_TAG} hit conflicts. Resolve manually per FORK.md; nothing was pushed."
+            echo "Rebase conflict: resolve manually per FORK.md. Nothing was pushed." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "Rebased ${FORK_BRANCH} onto \`${UPSTREAM_TAG}\`: $(git describe --tags --match "${UPSTREAM_TAG}" HEAD)." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Setup Node.js
+        if: steps.gate.outputs.proceed == 'true'
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install system dependencies
+        if: steps.gate.outputs.proceed == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep
+          sudo ln -s "$(which fdfind)" /usr/local/bin/fd
+
+      - name: Install dependencies
+        if: steps.gate.outputs.proceed == 'true'
+        run: npm ci --ignore-scripts
+
+      - name: Build
+        if: steps.gate.outputs.proceed == 'true'
+        run: npm run build
+
+      - name: Check
+        if: steps.gate.outputs.proceed == 'true'
+        run: npm run check
+
+      - name: Test
+        if: steps.gate.outputs.proceed == 'true'
+        run: npm test
+
+      - name: Push branch and release tag
+        if: steps.gate.outputs.release == 'true' && env.DRY_RUN != 'true'
+        env:
+          RELEASE_TAG: ${{ steps.gate.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          git push --force-with-lease origin "HEAD:${FORK_BRANCH}"
+          git tag "${RELEASE_TAG}"
+          # App-token pushes are not GITHUB_TOKEN pushes, so this tag push
+          # triggers release-binary.yml natively.
+          git push origin "${RELEASE_TAG}"
+          echo "Pushed ${FORK_BRANCH} and \`${RELEASE_TAG}\`; release triggered." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open escalation issue on failure
+        if: failure()
+        run: |
+          set -euo pipefail
+
+          gh issue create \
+            --title "weekly upstream sync failed ($(date -u +%F))" \
+            --body "The weekly upstream sync failed before anything was pushed. Resolve manually per FORK.md, then re-run the workflow. Run: ${GITHUB_SERVER_URL}/${GH_REPO}/actions/runs/${GITHUB_RUN_ID}" \
+            || echo "::warning::Could not create an issue (issues may be disabled on this fork); rely on the failed run notification."
