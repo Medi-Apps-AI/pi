@@ -94,7 +94,7 @@ const OpenAICompletionsCompatSchema = Type.Object({
 		]),
 	),
 	chatTemplateKwargs: Type.Optional(Type.Record(Type.String(), ChatTemplateKwargSchema)),
-	cacheControlFormat: Type.Optional(Type.Literal("anthropic")),
+	cacheControlFormat: Type.Optional(Type.Union([Type.Literal("anthropic"), Type.Literal("anthropic-message")])),
 	openRouterRouting: Type.Optional(OpenRouterRoutingSchema),
 	vercelGatewayRouting: Type.Optional(VercelGatewayRoutingSchema),
 	supportsOpenAIGrammarTools: Type.Optional(Type.Boolean()),
