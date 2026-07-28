@@ -337,9 +337,9 @@ const OpenAICompletionsCompatProperties = {
 		default: false,
 	}),
 	cacheControlFormat: opt(
-		stringLiteral("anthropic", {
+		union([stringLiteral("anthropic"), stringLiteral("anthropic-message")], {
 			description:
-				"Cache control convention for prompt caching. Anthropic applies cache_control markers to the system prompt, last tool definition, and last user, assistant, or tool-result text content.",
+				"Cache control convention for prompt caching. Anthropic applies cache_control markers to the system prompt, last tool definition, and last user, assistant, or tool-result text content. anthropic-message applies them on the message objects themselves (system and last conversation message) for gateways that only honor message-level placement, e.g. AssemblyAI's LLM Gateway.",
 		}),
 	),
 	sendSessionAffinityHeaders: optionalCompatBoolean({
