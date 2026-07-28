@@ -25,6 +25,9 @@ jobs:
   # Keep the public GitHub Release publication last. Binary assets are staged in
   # a draft release first; cleanup removes the draft if later publishing fails.
   build:
+    # Fork guard: this release flow (npm trusted publishing, draft staging)
+    # only works in the upstream repo. Forks use release-binary.yml instead.
+    if: github.repository == 'earendil-works/pi'
     runs-on: ubuntu-latest
     permissions:
       contents: read
