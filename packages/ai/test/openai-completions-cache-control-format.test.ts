@@ -24,6 +24,7 @@ interface CapturedParams {
 	messages: Array<{
 		role: string;
 		content: string | TextPart[] | null;
+		cache_control?: CacheControl;
 	}>;
 	tools?: ToolWithCacheControl[];
 }
@@ -198,6 +199,123 @@ describe("openai-completions cacheControlFormat", () => {
 		expect(toolMessage.role).toBe("tool");
 		expect(Array.isArray(toolMessage.content)).toBe(true);
 		expect((toolMessage.content as TextPart[])[0]?.cache_control).toEqual({ type: "ephemeral" });
+	});
+
+	it("auto-detects message-level cache markers for AssemblyAI gateway Claude models", async () => {
+		const model: Model<"openai-completions"> = {
+			id: "claude-sonnet-4-6",
+			name: "Claude Sonnet 4.6",
+			api: "openai-completions",
+			provider: "assemblyai",
+			baseUrl: "https://llm-gateway.assemblyai.com/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+			},
+			contextWindow: 200000,
+			maxTokens: 32000,
+		};
+
+		const params = await capturePayload(model);
+
+		const instructionMessage = getInstructionMessage(params);
+		expect(instructionMessage?.cache_control).toEqual({ type: "ephemeral" });
+		expect(typeof instructionMessage?.content).toBe("string");
+
+		expect(params.tools).toHaveLength(1);
+		expect(params.tools?.[0]?.cache_control).toBeUndefined();
+
+		const lastMessage = params.messages[params.messages.length - 1];
+		expect(lastMessage.role).toBe("user");
+		expect(lastMessage.cache_control).toEqual({ type: "ephemeral" });
+		expect(typeof lastMessage.content).toBe("string");
+	});
+
+	it("applies message-level cache markers when compat opts in explicitly", async () => {
+		const model: Model<"openai-completions"> = {
+			id: "some-claude-proxy",
+			name: "Some Claude Proxy",
+			api: "openai-completions",
+			provider: "custom",
+			baseUrl: "https://example.com/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+			},
+			contextWindow: 200000,
+			maxTokens: 32000,
+			compat: {
+				cacheControlFormat: "anthropic-message",
+			},
+		};
+
+		const params = await capturePayload(model);
+
+		const instructionMessage = getInstructionMessage(params);
+		expect(instructionMessage?.cache_control).toEqual({ type: "ephemeral" });
+		expect(params.tools?.[0]?.cache_control).toBeUndefined();
+		expect(params.messages[params.messages.length - 1]?.cache_control).toEqual({ type: "ephemeral" });
+	});
+
+	it("does not apply cache markers for non-Claude AssemblyAI gateway models", async () => {
+		const model: Model<"openai-completions"> = {
+			id: "gpt-5.5",
+			name: "GPT-5.5",
+			api: "openai-completions",
+			provider: "assemblyai",
+			baseUrl: "https://llm-gateway.assemblyai.com/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+			},
+			contextWindow: 272000,
+			maxTokens: 32000,
+		};
+
+		const params = await capturePayload(model);
+
+		for (const message of params.messages) {
+			expect(message.cache_control).toBeUndefined();
+		}
+		expect(params.tools?.[0]?.cache_control).toBeUndefined();
+	});
+
+	it("omits message-level cache markers when cacheRetention is none", async () => {
+		const model: Model<"openai-completions"> = {
+			id: "claude-sonnet-4-6",
+			name: "Claude Sonnet 4.6",
+			api: "openai-completions",
+			provider: "assemblyai",
+			baseUrl: "https://llm-gateway.assemblyai.com/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+			},
+			contextWindow: 200000,
+			maxTokens: 32000,
+		};
+
+		const params = await capturePayload(model, { cacheRetention: "none" });
+
+		const instructionMessage = getInstructionMessage(params);
+		expect(instructionMessage?.cache_control).toBeUndefined();
+		expect(params.messages[params.messages.length - 1]?.cache_control).toBeUndefined();
 	});
 
 	it("omits Anthropic-style cache markers when cacheRetention is none", async () => {
