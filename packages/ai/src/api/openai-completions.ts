@@ -183,6 +183,10 @@ type ChatCompletionToolWithCacheControl = OpenAI.Chat.Completions.ChatCompletion
 	cache_control?: OpenAICompatCacheControl;
 };
 
+type ChatCompletionMessageWithCacheControl = ChatCompletionMessageParam & {
+	cache_control?: OpenAICompatCacheControl;
+};
+
 function resolveCacheRetention(cacheRetention?: CacheRetention, env?: ProviderEnv): CacheRetention {
 	if (cacheRetention) {
 		return cacheRetention;
@@ -516,6 +520,30 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 
 					if (choice?.delta?.tool_calls) {
 						for (const toolCall of choice.delta.tool_calls as StreamingToolCallDelta[]) {
+							// Some gateways (e.g. AssemblyAI's Anthropic adapter) nest the
+							// tool-call id under `function.id` instead of the standard top-level
+							// `tool_calls[].id`. Lift it up so the id is captured; an empty id
+							// later 500s the follow-up request because the tool_use/tool_result
+							// ids can't be matched.
+							if (!toolCall.id) {
+								const nestedId = (toolCall.function as { id?: string } | undefined)?.id;
+								if (nestedId) toolCall.id = nestedId;
+							}
+							// The same adapter emits an empty tool_calls skeleton frame (no id,
+							// name, or arguments) before a plain text answer. Materializing it
+							// produces a phantom empty-named tool call that later 400/500s the
+							// follow-up request. Grammar-tool continuation frames also arrive
+							// without id/function, carrying only `custom`; those must not be
+							// skipped or their input is silently dropped.
+							if (
+								!toolCall.id &&
+								!toolCall.function?.name &&
+								!toolCall.function?.arguments &&
+								!toolCall.custom?.name &&
+								!toolCall.custom?.input
+							) {
+								continue;
+							}
 							const block = ensureToolCallBlock(toolCall);
 							if (!block.id && toolCall.id) {
 								block.id = toolCall.id;
@@ -707,11 +735,17 @@ function buildParams(
 		params.store = false;
 	}
 
-	if (options?.maxTokens) {
+	// Fall back to the model's configured max when the caller omits maxTokens.
+	// The agent loop doesn't pass one, and some gateways (e.g. AssemblyAI's LLM
+	// Gateway) apply a stingy per-model default cap (Claude 1000, Kimi 2048, ...)
+	// when max_tokens is absent, silently truncating long responses and tool-call
+	// arguments. Mirrors the anthropic-messages provider, which already does this.
+	const effectiveMaxTokens = options?.maxTokens ?? (model.maxTokens > 0 ? model.maxTokens : undefined);
+	if (effectiveMaxTokens) {
 		if (compat.maxTokensField === "max_tokens") {
-			(params as any).max_tokens = options.maxTokens;
+			(params as any).max_tokens = effectiveMaxTokens;
 		} else {
-			params.max_completion_tokens = options.maxTokens;
+			params.max_completion_tokens = effectiveMaxTokens;
 		}
 	}
 
@@ -733,7 +767,11 @@ function buildParams(
 	}
 
 	if (cacheControl) {
-		applyAnthropicCacheControl(messages, params.tools, cacheControl);
+		if (compat.cacheControlFormat === "anthropic-message") {
+			applyAnthropicMessageCacheControl(messages, cacheControl);
+		} else {
+			applyAnthropicCacheControl(messages, params.tools, cacheControl);
+		}
 	}
 
 	if (options?.toolChoice) {
@@ -905,7 +943,7 @@ function getCompatCacheControl(
 	compat: ResolvedOpenAICompletionsCompat,
 	cacheRetention: CacheRetention,
 ): OpenAICompatCacheControl | undefined {
-	if (compat.cacheControlFormat !== "anthropic" || cacheRetention === "none") {
+	if (!compat.cacheControlFormat || cacheRetention === "none") {
 		return undefined;
 	}
 
@@ -921,6 +959,39 @@ function applyAnthropicCacheControl(
 	addCacheControlToSystemPrompt(messages, cacheControl);
 	addCacheControlToLastTool(tools, cacheControl);
 	addCacheControlToLastConversationMessage(messages, cacheControl);
+}
+
+// Message-level placement for gateways that ignore cache_control inside
+// content parts and only honor it on the message object (e.g. AssemblyAI's
+// LLM Gateway). Content is left untouched, so user messages stay plain
+// strings, which such gateways also tend to require. Tools get no marker;
+// in Anthropic's prompt ordering (tools, then system, then messages) the
+// system breakpoint already covers the tool definitions.
+function applyAnthropicMessageCacheControl(
+	messages: ChatCompletionMessageParam[],
+	cacheControl: OpenAICompatCacheControl,
+): void {
+	for (const message of messages) {
+		if (message.role === "system" || message.role === "developer") {
+			(message as ChatCompletionMessageWithCacheControl).cache_control = cacheControl;
+			break;
+		}
+	}
+
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (message.role !== "user" && message.role !== "assistant" && message.role !== "tool") {
+			continue;
+		}
+		const content = message.content;
+		const hasContent =
+			typeof content === "string" ? content.length > 0 : Array.isArray(content) && content.length > 0;
+		if (!hasContent) {
+			continue;
+		}
+		(message as ChatCompletionMessageWithCacheControl).cache_control = cacheControl;
+		return;
+	}
 }
 
 function addCacheControlToSystemPrompt(
@@ -1431,6 +1502,7 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAIComplet
 	const isCloudflareAiGateway = provider === "cloudflare-ai-gateway" || baseUrl.includes("gateway.ai.cloudflare.com");
 	const isNvidia = provider === "nvidia" || baseUrl.includes("integrate.api.nvidia.com");
 	const isAntLing = provider === "ant-ling" || baseUrl.includes("api.ant-ling.com");
+	const isAssemblyAI = provider === "assemblyai" || baseUrl.includes("llm-gateway.assemblyai.com");
 
 	const isNonStandard =
 		isNvidia ||
@@ -1447,7 +1519,8 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAIComplet
 		baseUrl.includes("opencode.ai") ||
 		isCloudflareWorkersAI ||
 		isCloudflareAiGateway ||
-		isAntLing;
+		isAntLing ||
+		isAssemblyAI;
 
 	const useMaxTokens =
 		baseUrl.includes("chutes.ai") ||
@@ -1456,13 +1529,22 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAIComplet
 		isTogether ||
 		isNvidia ||
 		isAntLing ||
-		isZai;
+		isZai ||
+		isAssemblyAI;
 
 	const isGrok = provider === "xai" || baseUrl.includes("api.x.ai");
 	const isDeepSeek = provider === "deepseek" || baseUrl.includes("deepseek.com");
 	const isOpenRouterDeveloperRoleModel =
 		isOpenRouter && (model.id.startsWith("anthropic/") || model.id.startsWith("openai/"));
-	const cacheControlFormat = provider === "openrouter" && model.id.startsWith("anthropic/") ? "anthropic" : undefined;
+	// AssemblyAI's LLM Gateway only honors Anthropic prompt caching via
+	// cache_control placed on the message object itself; block-level markers
+	// are silently ignored. Caching is explicit only for Claude models there.
+	const cacheControlFormat =
+		provider === "openrouter" && model.id.startsWith("anthropic/")
+			? "anthropic"
+			: isAssemblyAI && model.id.startsWith("claude-")
+				? "anthropic-message"
+				: undefined;
 
 	return {
 		supportsStore: !isNonStandard,
@@ -1492,7 +1574,7 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAIComplet
 		chatTemplateKwargs: {},
 		chatTemplateArgs: {},
 		zaiToolStream: false,
-		supportsStrictMode: !isMoonshot && !isTogether && !isCloudflareAiGateway && !isNvidia,
+		supportsStrictMode: !isMoonshot && !isTogether && !isCloudflareAiGateway && !isNvidia && !isAssemblyAI,
 		supportsOpenAIGrammarTools: false,
 		cacheControlFormat,
 		sendSessionAffinityHeaders: false,
